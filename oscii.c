@@ -11,13 +11,15 @@
 #include <time.h>
 #include <SDL2/SDL.h>
 
+#define MAXVAL 1024
+
 static char *progname;
-static int sample_len = 50000;
+static int sample_len = 20000;
 static int *samples;
 static uint64_t *sample_times;
 static int sample_head = 0, sample_tail = 0;
-static int sample_busy = 0;
-
+static volatile int sample_busy = 0;
+static int verbose = 0;
 
 void
 usage(retcode)
@@ -25,7 +27,7 @@ usage(retcode)
 	FILE *out;
 	out = retcode == 0 ? stdout : stderr;
 	fprintf(out,
-	   "%s -W <width> -H <height> -X <sample-ms> -Y <max-Y> -s <baudrate> input-dev\n"
+	   "%s -v -W <width> -H <height> -X <sample-ms> -Y <max-Y> -s <baudrate> -r <refresh-rate> input-dev\n"
 	   "  x-axis sample-ms the number of milliseconds to take one\n"
 	   "  snapshot sample of the input data\n", progname);
 	exit(retcode);
@@ -37,7 +39,10 @@ struct plotarg {
 	int sample_msecs;
 	int max_y;
 
+	int refresh_rate;
 	int terminated;
+
+	SDL_Renderer *renderer;
 };
 
 
@@ -111,7 +116,7 @@ plot_points(struct plotarg *opts, SDL_Renderer *renderer, int end)
 	int i;
 	int n = 0;
 	int y;
-	int x;
+	int x, x0;
 	int len;
 	int xrange = opts->width - GUTTER;
 	int yrange = opts->height - GUTTER;
@@ -127,16 +132,16 @@ plot_points(struct plotarg *opts, SDL_Renderer *renderer, int end)
 
 	// Compress data to ranges
 	x = GUTTER;
+	x0 = GUTTER;
 	for (i = sample_head; i != end;) {
 		x = GUTTER + (xrange * n / len);
 		y = opts->height - GUTTER -
 		    (yrange * samples[i] / opts->max_y);
 
-		if ((y > prev && (y - prev) > 10) || (y < prev && (prev - y) > 10)) {
-			SDL_RenderDrawLine(renderer, x-1, prev, x, y);
-		}
+		SDL_RenderDrawLine(renderer, x0, prev, x, y);
 		SDL_RenderDrawPoint(renderer, x, y);
 		prev = y;
+		x0 = x;
 
 		n++;
 
@@ -146,13 +151,54 @@ plot_points(struct plotarg *opts, SDL_Renderer *renderer, int end)
 	}
 }
 
+int
+doplot(struct plotarg *opts)
+{
+	uint64_t te;
+	int end;
+
+	if (sample_busy) {
+		return sample_head;
+	}
+
+	// render sample
+	sample_busy = 1;
+
+	// refresh plot
+	draw_grid(opts, opts->renderer);
+
+	if (sample_head == sample_tail) {
+		// no samples yet
+		sample_busy = 0;
+		return sample_head;
+	}
+
+	// find range to fit inside sample_msecs
+	te = sample_times[sample_head] + (opts->sample_msecs * 1000);
+	for (end = sample_head+1; end != sample_tail; ) {
+		if (sample_times[end] >= te) {
+			break;
+		}
+		end++;
+		if (end >= sample_len)
+			end = 0;
+	}
+
+	plot_points(opts, opts->renderer, end);
+
+	SDL_RenderPresent(opts->renderer);
+
+	sample_head = end;
+	sample_busy = 0;
+
+	return end;
+}
+
 void
 plotrun(void *arg)
 {
 	struct plotarg *opts = arg;
 	SDL_Event event;
-	int end;
-	uint64_t te;
 
 	SDL_Init(SDL_INIT_VIDEO);
 
@@ -161,11 +207,10 @@ plotrun(void *arg)
 		opts->width, opts->height, 0);
 
 	SDL_Renderer *renderer = SDL_CreateRenderer(window, -1, 0);
+	opts->renderer = renderer;
 
 	SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
 	SDL_RenderClear(renderer);
-
-	SDL_SetRenderDrawColor(renderer, 0, 200, 0, 255);
 
 	draw_grid(opts, renderer);
 	SDL_RenderPresent(renderer);
@@ -175,38 +220,15 @@ plotrun(void *arg)
 
 		switch (event.type) {
 		case SDL_MOUSEBUTTONUP:
-			// refresh plot
-			draw_grid(opts, renderer);
-
-			if (sample_head == sample_tail) {
-				// no samples yet
-				break;
-			}
-
-			// render sample
-			sample_busy = 1;
-
-			// find range to fit inside sample_msecs
-			te = sample_times[sample_head] + (opts->sample_msecs * 1000);
-			for (end = sample_head+1; end != sample_tail; ) {
-				if (sample_times[end] >= te) {
-					break;
-				}
-				end++;
-				if (end >= sample_len)
-					end = 0;
-			}
-
-			plot_points(opts, renderer, end);
-
-			sample_busy = 0;
+		case SDL_USEREVENT:
+			doplot(opts);
 			break;
 
 		case SDL_QUIT:
 			goto done;
 		}
 
-		SDL_RenderPresent(renderer);
+		SDL_RenderPresent(opts->renderer);
 	}
 
 done:
@@ -263,6 +285,12 @@ opendev(char *name, int speed)
 	return fd;
 }
 
+static uint64_t
+usec(struct timeval *tv)
+{
+	return (1000000 * tv->tv_sec + tv->tv_usec);
+}
+
 int
 main(int argc, char *argv[])
 {
@@ -275,17 +303,22 @@ main(int argc, char *argv[])
 	char *devname;
 	pthread_t thread;
 	struct timeval tv;
+	struct timeval tv_render;
+
+	SDL_Event event;
+	SDL_UserEvent ue;
 
 	opts.width = 800;
 	opts.height = 600;
 	opts.max_y = 1200;
 	opts.sample_msecs = 1000;
 	opts.terminated = 0;
+	opts.refresh_rate = 0;
 
 	speed = 115200;
 
 	progname = argv[0];
-	while ((c = getopt(argc, argv, "hW:H:X:Y:s:")) != -1) {
+	while ((c = getopt(argc, argv, "hvW:H:X:Y:s:r:")) != -1) {
 		switch (c) {
 		case 'h':
 			usage(0);
@@ -311,6 +344,14 @@ main(int argc, char *argv[])
 			speed = atoi(optarg);
 			break;
 
+		case 'r':
+			opts.refresh_rate = atoi(optarg);
+			break;
+
+		case 'v':
+			verbose = 1;
+			break;
+
 		default:
 			usage(1);
 		}
@@ -330,6 +371,7 @@ main(int argc, char *argv[])
 
 	pthread_create(&thread, NULL, plotrun, &opts);
 
+calibrate:
 	// calibrate input (find 0xff)
 	for (;;) {
 		nread = read(fd, &v, 1);
@@ -356,6 +398,12 @@ main(int argc, char *argv[])
 		}
 	}
 
+	ue.type = SDL_USEREVENT;
+	ue.code = 0;
+	event.type = SDL_USEREVENT;
+	event.user = ue;
+
+	gettimeofday(&tv_render, NULL);
 	while (!opts.terminated) {
 		// Read samples and put in circular buffer.
 		// When the user clicks on the mouse, the current sample set
@@ -363,10 +411,16 @@ main(int argc, char *argv[])
 		nread = read(fd, &v, 1);
 		gettimeofday(&tv, NULL);
 		if (nread == 1) {
+			if (verbose)
+				printf("%u ", 0xff & v);
 			c = v << 8;
 			nread = read(fd, &v, 1);
+			if (verbose)
+				printf("%u ... ", 0xff & v);
 			c |= v;
 			nread = read(fd, &v, 1);
+			if (verbose)
+				printf("%u\n", 0xff & v);
 		}
 		if (nread <= 0) {
 			close(fd);
@@ -375,8 +429,15 @@ main(int argc, char *argv[])
 			exit(1);
 		}
 
+		// loss packets; recalibrate
+		if (c > MAXVAL)
+			goto calibrate;
+
 		if (!sample_busy) {
 			samples[sample_tail] = c;
+			if (verbose) {
+				printf("%d\n", c);
+			}
 			sample_times[sample_tail] = 1000000 * tv.tv_sec + tv.tv_usec;
 			sample_tail++;
 			if (sample_tail >= sample_len)
@@ -386,6 +447,15 @@ main(int argc, char *argv[])
 				sample_head++;
 				if (sample_head >= sample_len)
 					sample_head = 0;
+			}
+		}
+
+		if (opts.renderer > 0) {
+			if (opts.refresh_rate > 0 &&
+			    (usec(&tv) - usec(&tv_render)) >= opts.refresh_rate * 1000) {
+				gettimeofday(&tv_render, NULL);
+				SDL_PushEvent(&event);
+				//doplot(&opts);
 			}
 		}
 	}
